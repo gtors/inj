@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod containers;
 mod providers;
+mod schema;
 
 pub use containers::{DynamicContainer, WiringConfiguration};
 pub use providers::{DependenciesContainer, Dependency, Provider};

@@ -1,8 +1,9 @@
-use crate::providers;
-use pyo3::exceptions::PyRuntimeError;
+use crate::{providers, schema};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyTuple, PyType};
-use pyo3::PyTypeInfo;
+use pyo3::types::{PyDict, PyNone, PyTuple, PyType};
+use pyo3::{PyTypeCheck, PyTypeInfo};
 use std::collections::HashMap;
 
 // use py_async_futures::futures::future::Future;
@@ -56,17 +57,52 @@ impl Default for WiringConfiguration {
     }
 }
 
-#[pyclass]
+/// Base class for containers
+#[pyclass(subclass)]
+pub struct Container {
+    attributes: HashMap<String, PyObject>,
+}
+
+#[pymethods]
+impl Container {
+    #[new]
+    fn new() -> Self {
+        Self {
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn __getattr__(&self, name: String) -> PyResult<PyObject> {
+        if let Some(value) = self.attributes.get(&name) {
+            Ok(value.clone())
+        } else {
+            Err(PyAttributeError::new_err(name.to_string()))
+        }
+    }
+
+    fn __setattr__(&mut self, py: Python, name: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.attributes.insert(name, value.into_py(py));
+        Ok(())
+    }
+
+    fn __delattr__(&mut self, name: &str) -> PyResult<()> {
+        self.attributes.remove(name);
+        Ok(())
+    }
+}
+
+/// Dynamic inversion of control container
+#[pyclass(extends=Container, subclass)]
 #[derive(Clone)]
 pub struct DynamicContainer {
     #[pyo3(get)]
     pub provider_type: Py<PyType>,
     #[pyo3(get)]
-    pub providers: HashMap<String, Py<PyAny>>,
+    pub providers: HashMap<String, Py<providers::Provider>>,
     #[pyo3(get)]
     pub overridden: Vec<Py<PyAny>>,
     #[pyo3(get)]
-    pub parent: Option<Py<PyAny>>,
+    pub parent: Option<Py<Self>>,
     #[pyo3(get)]
     pub declarative_parent: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -82,8 +118,8 @@ pub struct DynamicContainer {
 #[pymethods]
 impl DynamicContainer {
     #[new]
-    fn new(py: Python) -> PyResult<Self> {
-        Ok(Self {
+    fn new(py: Python) -> (Self, Container) {
+        let this = Self {
             provider_type: providers::Provider::type_object_bound(py).unbind(),
             providers: HashMap::new(),
             overridden: Vec::new(),
@@ -93,7 +129,9 @@ impl DynamicContainer {
             wired_to_modules: Vec::new(),
             wired_to_packages: Vec::new(),
             // __self__: Py::new(Self)?,
-        })
+        };
+        let base = Container::new();
+        (this, base)
     }
 
     // fn __deepcopy__(&self, memo: &mut HashMap<usize, Py<PyAny>>) -> PyResult<Py<PyAny>> {
@@ -123,23 +161,37 @@ impl DynamicContainer {
     //     Ok(copied.into())
     // }
 
+    /// Set instance attribute.
+    ///
+    /// If value of attribute is provider, it will be added into providers
+    /// dictionary.
     fn __setattr__(&mut self, py: Python, name: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let is_provider = providers::Provider::is_type_of_bound(value);
-        if is_provider && name != "parent" {
+        if providers::Provider::type_check(value) && name != "parent" {
             self.check_provider_type(py, value)?;
-            self.providers.insert(name.clone(), value.into_py(py));
+            self.providers.insert(
+                name.clone(),
+                value
+                    .downcast::<providers::Provider>()
+                    .map(|p| p.clone().unbind())?,
+            );
 
             // if isinstance(value, providers.CHILD_PROVIDERS):
             //     value.assign_parent(self)
         }
+        // let mut super_ = self_.into_super();
+        // super_.__setattr__(py, name, value)?;
         Ok(())
     }
-    //
-    // fn __delattr__(&mut self, name: &str) -> PyResult<()> {
-    //     self.providers.remove(name);
-    //     Ok(())
-    // }
-    //
+
+    /// Delete instance attribute.
+    ///
+    /// If value of attribute is provider, it will be deleted from providers
+    /// dictionary.
+    fn __delattr__(mut self_: PyRefMut<Self>, name: &str) -> PyResult<()> {
+        self_.providers.remove(name);
+        self_.into_super().__delattr__(name)?;
+        Ok(())
+    }
 
     /// Return dependency providers dictionary.
     ///
@@ -150,7 +202,7 @@ impl DynamicContainer {
     ///     dict[str, :py:class:`dependency_injector.providers.Provider`]
     /// """
     #[getter]
-    fn dependencies(&self, py: Python) -> PyResult<HashMap<String, PyObject>> {
+    fn dependencies(&self, py: Python) -> PyResult<HashMap<String, Py<providers::Provider>>> {
         let dependency_types = PyTuple::new_bound(
             py,
             &[
@@ -177,9 +229,31 @@ impl DynamicContainer {
     //     providers_module.call_method1("traverse", (providers_tuple, types))
     // }
     //
-    // fn set_provider(&mut self, name: String, provider: PyObject) -> PyResult<()> {
-    //     self.__setattr__(py, name, provider)
-    // }
+
+    /// Set container providers
+    #[pyo3(signature = (**providers))]
+    fn set_providers(
+        &mut self,
+        py: Python,
+        providers: Option<HashMap<String, Bound<'_, providers::Provider>>>,
+    ) -> PyResult<()> {
+        if let Some(providers) = providers {
+            for (name, provider) in providers.iter() {
+                self.__setattr__(py, name.clone(), provider)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set container provider  
+    fn set_provider(
+        &mut self,
+        py: Python,
+        name: String,
+        provider: &Bound<'_, providers::Provider>,
+    ) -> PyResult<()> {
+        self.__setattr__(py, name, provider)
+    }
     //
     // fn override(&mut self, py: Python, overriding: PyObject) -> PyResult<()> {
     //     let self_ref: PyObject = self.into();
@@ -195,54 +269,10 @@ impl DynamicContainer {
     //     self.overridden.clear();
     // }
     //
-    //
-    // fn __setattr__(&mut self, name: &str, value: &PyAny) -> PyResult<()> {
-    //     if value.is_instance::<providers::Provider>()
-    //         && !value.is_instance::<providers::Self>()
-    //         && name != "parent"
-    //     {
-    //         _check_provider_type(self, value)?;
-    //
-    //         self.providers.insert(name.to_string(), value.clone());
-    //
-    //         if value.is_instance::<providers::CHILD_PROVIDERS>() {
-    //             value.as_ref::<providers::CHILD_PROVIDERS>()?.assign_parent(self)?;
-    //         }
-    //     }
-    //
-    //     super::__setattr__(name, value)
-    // }
-    //
-    // fn __delattr__(&mut self, name: &str) -> PyResult<()> {
-    //     if self.providers.contains_key(name) {
-    //         self.providers.remove(name);
-    //     }
-    //     super::__delattr__(name)
-    // }
-    //
-    // #[property]
-    // fn dependencies(&self) -> HashMap<String, Py<PyAny>> {
-    //     self.providers
-    //         .iter()
-    //         .filter(|(_, provider)| provider.is_instance::<providers::Dependency>() || provider.is_instance::<providers::DependenciesContainer>())
-    //         .map(|(name, provider)| (name.clone(), provider.clone()))
-    //         .collect()
-    // }
-    //
     // fn traverse(&self, types: Option<Vec<Py<PyAny>>>) -> impl Iterator<Item = Py<PyAny>> {
     //     providers::traverse(self.providers.values(), types).map(|p| p.into())
     // }
     //
-    // fn set_providers(&mut self, providers: HashMap<String, Py<PyAny>>) -> PyResult<()> {
-    //     for (name, provider) in providers.iter() {
-    //         self.__setattr__(name, provider)?;
-    //     }
-    //     Ok(())
-    // }
-    //
-    // fn set_provider(&mut self, name: &str, provider: &PyAny) -> PyResult<()> {
-    //     self.__setattr__(name, provider)
-    // }
     //
     // fn override(&mut self, overriding: &Py<PyAny>) -> PyResult<()> {
     //     if overriding == self.__self__ {
@@ -477,13 +507,15 @@ impl DynamicContainer {
     //         undefined.join(", ")
     //     )))
     // }
-    //
-    // fn from_schema(&mut self, schema: &PyDict) -> PyResult<()> {
-    //     for (name, provider) in schema {
-    //         self.set_provider(name.as_str()?, provider)?;
-    //     }
-    //     Ok(())
-    // }
+
+    /// Build container providers from schema
+    fn from_schema(&mut self, py: Python, schema: &PyDict) -> PyResult<()> {
+        let schema = schema::build_schema(schema);
+        for (name, provider) in schema.iter() {
+            self.set_provider(py, name.extract()?, provider)?;
+        }
+        Ok(())
+    }
     //
     // fn from_yaml_schema(&mut self, filepath: &str, loader: Option<Py<PyAny>>) -> PyResult<()> {
     //     let yaml = py().import("yaml")?;
@@ -498,24 +530,40 @@ impl DynamicContainer {
     //     let schema = py().import("json")?.call_method1("load", (file,))?;
     //     self.from_schema(schema)
     // }
-    //
-    // fn resolve_provider_name(&self, provider: &PyAny) -> PyResult<String> {
-    //     for (name, container_provider) in &self.providers {
-    //         if container_provider.as_ptr() == provider.as_ptr() {
-    //             return Ok(name.to_owned());
-    //         }
-    //     }
-    //     Err(py().new_err(format!("Can not resolve name for provider \"{:?}\"", provider)))
-    // }
-    //
-    // fn parent_name(&self) -> Option<String> {
-    //     self.parent.as_ref().map(|parent| parent.parent_name())
-    //         .or_else(|| self.declarative_parent.as_ref().map(|parent| parent.name().to_owned()))
-    // }
-    //
-    // fn assign_parent(&mut self, parent: &Py<DynamicContainer>) {
-    //     self.parent = Some(parent);
-    // }
+
+    /// Try to resolve provider name
+    fn resolve_provider_name(&self, provider: Bound<'_, providers::Provider>) -> PyResult<String> {
+        for (provider_name, container_provider) in &self.providers {
+            if container_provider.is(provider.as_ref()) {
+                return Ok(provider_name.to_owned());
+            }
+        }
+        // Err(PyRuntimeError::new_err(format!(
+        //     "Can not resolve name for provider \"{}\"",
+        //     provider
+        // )))
+        Err(PyRuntimeError::new_err("Can not resolve name for provider"))
+    }
+
+    /// Return parent name
+    #[getter]
+    fn parent_name(&self, py: Python) -> PyResult<PyObject> {
+        self.parent
+            .as_ref()
+            .map(|parent| parent.call_method0(py, intern!(py, "parent_name")))
+            .unwrap_or(Ok(PyNone::get_bound(py).into_py(py)))
+        // .or_else(|| {
+        //     self.declarative_parent
+        //         .as_ref()
+        //         .map(|parent| parent.name().to_owned())
+        // })
+    }
+
+    /// Assign parent
+    fn assign_parent(&mut self, parent: Bound<'_, Self>) -> PyResult<()> {
+        self.parent = Some(parent.into());
+        Ok(())
+    }
 }
 
 impl DynamicContainer {
