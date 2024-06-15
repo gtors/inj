@@ -1,7 +1,7 @@
 use crate::containers;
 
 use crate::providers;
-use pyo3::types::{PyDict, PyIterator, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 use pyo3::{prelude::*, PyTypeInfo};
 
 use pyo3::create_exception;
@@ -112,8 +112,8 @@ impl SchemaProcessorV1 {
             }
 
             if let Ok(ref arg_injections) = data.get_item("args") {
-                for arg in arg_injections.downcast::<PyIterator>()?.iter() {
-                    args.push(self._resolve_injection(py, &arg)?);
+                for arg in arg_injections.iter()? {
+                    args.push(self._resolve_injection(py, &arg?)?);
                 }
             }
 
@@ -174,7 +174,8 @@ impl SchemaProcessorV1 {
                     provider_args.push(provides);
                 }
                 if let Ok(ref args) = arg.get_item("args") {
-                    for provider_arg in args.downcast::<PyIterator>()?.iter() {
+                    for provider_arg in args.iter()? {
+                        let provider_arg = provider_arg?;
                         if _is_str_starts_with_container(&provider_arg)? {
                             let provider_arg: &str = provider_arg.extract()?;
                             provider_args.push(self._resolve_provider(py, &provider_arg[10..])?)

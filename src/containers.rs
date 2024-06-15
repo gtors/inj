@@ -2,7 +2,7 @@ use crate::{providers, schema};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyNone, PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
 use pyo3::{PyTypeCheck, PyTypeInfo};
 use std::collections::HashMap;
 
