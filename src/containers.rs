@@ -255,20 +255,33 @@ impl DynamicContainer {
     ) -> PyResult<()> {
         self.__setattr__(py, name, provider)
     }
-    //
-    // fn override(&mut self, py: Python, overriding: PyObject) -> PyResult<()> {
-    //     let self_ref: PyObject = self.into();
-    //     if overriding == self_ref {
-    //         Err(pyo3::exceptions::PyValueError::new_err("Container cannot override itself"))
-    //     } else {
-    //         self.overridden.push(overriding.clone_ref(py));
-    //         Ok(())
-    //     }
-    // }
-    //
-    // fn reset_override(&mut self) {
-    //     self.overridden.clear();
-    // }
+
+    /// Override current container by overriding container
+    fn r#override(mut _self: PyRefMut<'_, Self>, py: Python, overriding: PyObject) -> PyResult<()> {
+        if overriding.is(&_self) {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "Container cannot override itself",
+            ))
+        } else {
+            _self.overridden.push(overriding.clone_ref(py));
+
+            let providers = overriding.getattr(py, "providers")?;
+            let providers = providers.downcast_bound::<PyDict>(py)?;
+            let _self = _self.into_py(py);
+
+            for (name, provider) in providers.iter() {
+                if let Ok(attr) = _self.getattr(py, name.downcast()?) {
+                    attr.call_method1(py, "override", (provider,))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn reset_override(&mut self) {
+        self.overridden.clear();
+    }
+
     //
     // fn traverse(&self, types: Option<Vec<Py<PyAny>>>) -> impl Iterator<Item = Py<PyAny>> {
     //     providers::traverse(self.providers.values(), types).map(|p| p.into())
