@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use std::collections::HashMap;
 
-#[pyclass(subclass)]
+#[pyclass(module = "inj", subclass)]
 #[derive(Clone)]
 pub struct Provider {
     #[pyo3(get, set)]
@@ -69,7 +69,7 @@ impl Provider {
     // }
 }
 
-#[pyclass(extends=Provider, subclass)]
+#[pyclass(extends=Provider, module="inj", subclass)]
 #[derive(Default)]
 pub struct Dependency {
     instance_of: Option<Py<PyType>>,
@@ -106,7 +106,7 @@ impl Dependency {
     }
 }
 
-#[pyclass(extends=Provider, subclass)]
+#[pyclass(extends=Provider, module="inj", subclass)]
 pub struct DependenciesContainer {
     providers: HashMap<String, Py<PyObject>>,
     parent: Option<Py<PyObject>>,
@@ -120,6 +120,41 @@ impl DependenciesContainer {
         let this = DependenciesContainer {
             providers: HashMap::new(),
             parent: None,
+        };
+        let base = Provider::new();
+        (this, base)
+    }
+}
+
+// Container provider provides an instance of declarative container.
+#[pyclass(extends=Provider, module="inj", subclass)]
+pub struct Container {
+    container_cls: Option<Py<PyType>>,
+}
+
+#[pymethods]
+impl Container {
+    #[new]
+    fn new() -> (Self, Provider) {
+        // def __init__(self, container_cls=None, container=None, **overriding_providers):
+        //     """Initialize provider."""
+        //     self.__container_cls = container_cls
+        //     self.__overriding_providers = overriding_providers
+        //
+        //     if container is None and container_cls:
+        //         container = container_cls()
+        //         container.assign_parent(self)
+        //     self.__container = container
+        //
+        //     if self.__container and self.__overriding_providers:
+        //         self.apply_overridings()
+        //
+        //     self.__parent = None
+        //
+        //     super(Container, self).__init__()
+
+        let this = Container {
+            container_cls: None,
         };
         let base = Provider::new();
         (this, base)

@@ -58,7 +58,7 @@ impl Default for WiringConfiguration {
 }
 
 /// Base class for containers
-#[pyclass(subclass)]
+#[pyclass(subclass, dict)]
 pub struct Container {
     attributes: HashMap<String, PyObject>,
 }
@@ -92,7 +92,7 @@ impl Container {
 }
 
 /// Dynamic inversion of control container
-#[pyclass(extends=Container, subclass)]
+#[pyclass(extends=Container, module="inj", subclass)]
 #[derive(Clone)]
 pub struct DynamicContainer {
     #[pyo3(get)]
@@ -120,7 +120,7 @@ impl DynamicContainer {
     #[new]
     fn new(py: Python) -> (Self, Container) {
         let this = Self {
-            provider_type: providers::Provider::type_object_bound(py).unbind(),
+            provider_type: providers::Provider::type_object_bound(py).into(),
             providers: HashMap::new(),
             overridden: Vec::new(),
             parent: None,
@@ -509,10 +509,11 @@ impl DynamicContainer {
     // }
 
     /// Build container providers from schema
-    fn from_schema(&mut self, py: Python, schema: &PyDict) -> PyResult<()> {
-        let schema = schema::build_schema(schema);
+    fn from_schema(&mut self, py: Python, schema: Py<PyDict>) -> PyResult<()> {
+        let schema = schema::build_schema(schema)?;
+        let schema = schema.bind(py);
         for (name, provider) in schema.iter() {
-            self.set_provider(py, name.extract()?, provider)?;
+            self.set_provider(py, name.extract()?, provider.downcast()?)?;
         }
         Ok(())
     }
@@ -551,7 +552,7 @@ impl DynamicContainer {
         self.parent
             .as_ref()
             .map(|parent| parent.call_method0(py, intern!(py, "parent_name")))
-            .unwrap_or(Ok(PyNone::get_bound(py).into_py(py)))
+            .unwrap_or(Ok(py.None().into_py(py)))
         // .or_else(|| {
         //     self.declarative_parent
         //         .as_ref()

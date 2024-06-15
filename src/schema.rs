@@ -1,153 +1,287 @@
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use crate::containers;
+
+use crate::providers;
+use pyo3::types::{PyDict, PyIterator, PyString, PyTuple, PyType};
+use pyo3::{prelude::*, PyTypeInfo};
 
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 
 create_exception!(inj, SchemaError, PyException);
 
-#[pyclass]
 pub struct SchemaProcessorV1 {
-    _schema: PyObject,
-    _container: PyObject,
+    schema: Py<PyDict>,
+    container: Py<containers::Container>,
 }
 
-#[pymethods]
 impl SchemaProcessorV1 {
-    #[new]
-    fn new(schema: &PyDict) -> Self {
-        let container = PyDict::new();
-        Self {
-            _schema: schema.into(),
-            _container: container.into(),
-        }
+    fn new(py: Python, schema: Py<PyDict>) -> PyResult<Self> {
+        Ok(Self {
+            schema: schema.clone(),
+            container: py
+                .get_type_bound::<containers::DynamicContainer>()
+                .call0()?
+                .downcast::<containers::Container>()?
+                .clone()
+                .into(),
+        })
     }
 
-    fn process(&mut self) {
-        self._create_providers(self._schema.get_item("container").unwrap());
-        self._setup_injections(self._schema.get_item("container").unwrap());
+    pub fn process(&mut self, py: Python) -> PyResult<()> {
+        let container_schema =
+            self.schema
+                .bind(py)
+                .get_item("container")?
+                .ok_or(PyValueError::new_err(
+                    "shema have no 'container' key or it is empty",
+                ))?;
+
+        let container_schema = container_schema.downcast::<PyDict>()?;
+        self.create_providers(py, container_schema, None)?;
+        self.setup_injections(py, container_schema, None)?;
+        Ok(())
     }
 
-    fn get_providers(&self) -> PyObject {
-        self._container.get_item("providers").unwrap().clone()
+    fn get_providers(&self, py: Python) -> PyResult<PyObject> {
+        Ok(self.container.bind(py).getattr("providers")?.into())
     }
 
-    fn _create_providers(&mut self, provider_schema: &PyDict, container: Option<&PyDict>) {
-        let container = container.unwrap_or(&self._container);
-        for (provider_name, data) in provider_schema.into_iter() {
-            let provider = if let Some(provider_cls) = data.get_item("provider") {
-                let provider_type = _get_provider_cls(provider_cls);
-                let args = Vec::new();
-                // ...
-                provider_type.call(args, None).unwrap()
+    fn create_providers(
+        &mut self,
+        py: Python,
+        provider_schema: &Bound<'_, PyDict>,
+        container: Option<Py<containers::Container>>,
+    ) -> PyResult<()> {
+        let dynamic_container_type = py.get_type_bound::<containers::Container>();
+        let provider_container_type = py.get_type_bound::<providers::Container>();
+        let container = container.unwrap_or(self.container.clone());
+        let container = container.bind(py);
+
+        for (provider_name, data) in provider_schema.iter() {
+            let data = data.downcast::<PyDict>()?;
+            let provider = if let Some(provider_cls) = data.get_item("provider")? {
+                let provider_cls: &str = provider_cls.extract()?;
+                let provider_type = _get_provider_cls(provider_cls)?;
+                provider_type.call0(py)?
             } else {
-                // ...
-                PyDict::new().into()
+                provider_container_type
+                    .call1((dynamic_container_type.clone(),))?
+                    .into()
             };
-            container.set_item(provider_name, provider);
-            if let Some(provider) = provider.downcast::<PyDict>() {
-                self._create_providers(provider_schema, Some(provider));
+            let provider = provider.bind(py);
+            container.call_method1("set_provider", (provider_name, provider.clone()))?;
+
+            if providers::Container::is_type_of_bound(provider) {
+                self.create_providers(
+                    py,
+                    data,
+                    Some(
+                        provider
+                            .downcast::<providers::Container>()?
+                            .getattr("container")?
+                            .downcast::<containers::Container>()?
+                            .clone()
+                            .into(),
+                    ),
+                )?;
             }
         }
+        Ok(())
     }
 
-    fn _setup_injections(&mut self, provider_schema: &PyDict, container: Option<&PyDict>) {
-        let container = container.unwrap_or(&self._container);
-        for (provider_name, data) in provider_schema.into_iter() {
-            let provider = container.get_item(provider_name).unwrap();
-            let args = Vec::new();
-            let kwargs = PyDict::new();
-            // ...
-            if let Some(provides) = data.get_item("provides") {
-                // ...
-                provider.setattr("provides", provides);
+    fn setup_injections(
+        &mut self,
+        py: Python,
+        provider_schema: &Bound<'_, PyDict>,
+        container: Option<Py<containers::Container>>,
+    ) -> PyResult<()> {
+        let container = match container {
+            Some(c) => c,
+            None => self.container.clone(),
+        };
+
+        for (provider_name, data) in provider_schema.iter() {
+            let provider = container.getattr(py, provider_name.downcast_into()?)?;
+            let provider = provider.bind(py);
+            let mut args = Vec::<PyObject>::new();
+            let kwargs = PyDict::new_bound(py);
+
+            if let Ok(ref provides) = data.get_item("provides") {
+                let provides = self._resolve_provides(py, provides)?;
+                provider.call_method1("set_provides", (provides,))?;
             }
-            // ...
-            if let Some(arg_injections) = data.get_item("args") {
-                // ...
-                for arg in arg_injections.into_iter() {
-                    // ...
-                    args.push(arg);
+
+            if let Ok(ref arg_injections) = data.get_item("args") {
+                for arg in arg_injections.downcast::<PyIterator>()?.iter() {
+                    args.push(self._resolve_injection(py, &arg)?);
                 }
             }
-            // ...
-            if let Some(kwarg_injections) = data.get_item("kwargs") {
-                // ...
-                for (name, arg) in kwarg_injections.into_iter() {
-                    // ...
-                    kwargs.set_item(name, arg);
+
+            if !args.is_empty() {
+                provider.call_method1("add_args", PyTuple::new_bound(py, args))?;
+            }
+
+            if let Ok(ref kwarg_injections) = data.get_item("kwargs") {
+                for (name, arg) in kwarg_injections.downcast::<PyDict>()?.iter() {
+                    let injection = self._resolve_injection(py, &arg)?;
+                    kwargs.set_item(name, injection)?;
                 }
             }
-            // ...
-            if let Some(provider) = provider.downcast::<PyDict>() {
-                self._setup_injections(provider_schema, Some(provider));
+
+            if !kwargs.is_empty() {
+                provider.call_method("add_kwargs", (), Some(&kwargs))?;
+            }
+
+            if providers::Container::is_type_of_bound(provider) {
+                self.setup_injections(
+                    py,
+                    data.downcast()?,
+                    Some(
+                        provider
+                            .downcast::<providers::Container>()?
+                            .getattr("container")?
+                            .downcast::<containers::Container>()?
+                            .clone()
+                            .into(),
+                    ),
+                )?;
             }
         }
+
+        Ok(())
     }
 
-    fn _resolve_provider(&self, name: &str) -> Option<PyObject> {
-        // ...
-        let mut segments = name.split(".");
-        let mut provider = self._container.get_item(segments.next().unwrap())?;
-        for segment in segments {
-            // ...
-            provider = provider.get_item(segment)?;
+    fn _resolve_provides(&self, py: Python, provides: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        if _is_str_starts_with_container(provides)? {
+            let provides: &str = provides.extract()?;
+            self._resolve_provider(py, &provides[10..])
+        } else {
+            _import_string(provides.extract()?)
         }
-        Some(provider)
+    }
+
+    fn _resolve_injection(&self, py: Python, arg: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        Ok(match arg {
+            _ if _is_str_starts_with_container(&arg)? => {
+                let arg: &str = arg.extract()?;
+                self._resolve_provider(py, &arg[10..])?
+            }
+            _ if PyDict::is_type_of_bound(&arg) => {
+                let mut provider_args = Vec::<PyObject>::new();
+                let provider_type = _get_provider_cls(arg.get_item("provider")?.extract()?)?;
+                if let Ok(ref provides) = arg.get_item("provides") {
+                    let provides = self._resolve_provides(py, provides)?;
+                    provider_args.push(provides);
+                }
+                if let Ok(ref args) = arg.get_item("args") {
+                    for provider_arg in args.downcast::<PyIterator>()?.iter() {
+                        if _is_str_starts_with_container(&provider_arg)? {
+                            let provider_arg: &str = provider_arg.extract()?;
+                            provider_args.push(self._resolve_provider(py, &provider_arg[10..])?)
+                        }
+                    }
+                }
+                provider_type.call1(py, PyTuple::new_bound(py, provider_args))?
+            }
+            _ => arg.clone().into(),
+        })
+    }
+
+    fn _resolve_provider(&self, py: Python, name: &str) -> PyResult<PyObject> {
+        let segments: Vec<&str> = name.split(".").collect();
+        let mut provider = self.container.getattr(py, *segments.get(0).unwrap())?;
+
+        for segment in &segments[1..] {
+            let (segment, have_parentheses) =
+                if let (Some(start), Some(end)) = (segment.find("("), segment.find(")")) {
+                    ((segment[start..end + 1]).to_string(), true)
+                } else {
+                    (segment.to_string(), false)
+                };
+
+            provider = provider.getattr(py, segment.as_str())?;
+
+            if have_parentheses {
+                provider = provider.call0(py)?;
+            }
+        }
+        Ok(provider)
     }
 }
 
-fn _get_provider_cls(provider_cls_name: &str) -> PyObject {
-    // ...
-    let provider_type = _fetch_provider_cls_from_std(provider_cls_name);
-    if provider_type.is_none() {
-        _import_provider_cls(provider_cls_name)
-    } else {
-        provider_type
+fn _get_provider_cls(provider_cls_name: &str) -> PyResult<Py<PyType>> {
+    match _fetch_provider_cls_from_std(provider_cls_name) {
+        Some(provider_type) => Ok(provider_type),
+        None => _import_provider_cls(provider_cls_name),
     }
 }
 
-fn _fetch_provider_cls_from_std(provider_cls_name: &str) -> Option<PyObject> {
-    // ...
-    let provider_type = PyModule::import("providers")?.getattr(provider_cls_name)?;
-    if provider_type.is_instance_of::<PyType>() {
-        Some(provider_type)
-    } else {
-        None
-    }
+fn _fetch_provider_cls_from_std(provider_cls_name: &str) -> Option<Py<PyType>> {
+    Python::with_gil(|py| match provider_cls_name {
+        "Provider" => Some(providers::Provider::type_object_bound(py).into()),
+        // TODO: add other classes
+        _ => None,
+    })
 }
 
-fn _import_provider_cls(provider_cls_name: &str) -> Option<PyObject> {
-    // ...
-    let module_name = provider_cls_name.split(".").collect::<Vec<_>>()[..-1].join(".");
-    let module = PyModule::import(module_name)?;
-    let cls = module.getattr(provider_cls_name)?;
-    if cls.is_instance_of::<PyType>() {
-        Some(cls)
-    } else {
-        None
-    }
+fn _import_provider_cls(provider_cls_name: &str) -> PyResult<Py<PyType>> {
+    let result = _import_string(provider_cls_name);
+    Python::with_gil(|py| {
+        let provider_type = py.get_type_bound::<providers::Provider>();
+        match result {
+            Ok(cls) => match cls.downcast_bound::<PyType>(py) {
+                Ok(cls) if cls.is_subclass(&provider_type).unwrap_or(false) => {
+                    Ok(cls.clone().into())
+                }
+                _ => Err(SchemaError::new_err(format!(
+                    "Provider class {} is not a subclass of providers base class",
+                    provider_cls_name
+                ))),
+            },
+            Err(err) => Err({
+                let schema_err = SchemaError::new_err(format!(
+                    "Can not import provider '{}'",
+                    provider_cls_name
+                ));
+                schema_err.set_cause(py, Some(err));
+                schema_err
+            }),
+        }
+    })
 }
 
 fn _import_string(string_name: &str) -> PyResult<PyObject> {
     Python::with_gil(|py| {
-        let segments: Vec<&str> = string_name.split(".").collect();
-        let (module_parts, member_name) = match &segments[..] {
-            [member_name] => (&["builtins"][..], *member_name),
-            [member_parts @ .., member_name] => (member_parts, *member_name),
-            _ => return Err(PyValueError::new_err("string should not be empty")),
-        };
-        let module_name = module_parts.join(".");
-        let module = PyModule::import_bound(py, module_name.as_str())?;
-        let member = module.getattr(member_name)?;
-        Ok(member.into_py(py))
+        if let Some((module_name, member_name)) = string_name.rsplit_once(".") {
+            let module = PyModule::import_bound(py, module_name)?;
+            let member = module.getattr(member_name)?;
+            Ok(member.into_py(py))
+        } else if !string_name.is_empty() {
+            let module = py.import_bound("builtins")?;
+            let member = module.getattr(string_name)?;
+            Ok(member.into_py(py))
+        } else {
+            Err(PyValueError::new_err("string should not be empty"))
+        }
     })
 }
 
+fn _is_str_starts_with_container(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(PyString::is_type_of_bound(&obj)
+        && obj
+            .call_method1("startswith", ("container.",))?
+            .extract::<bool>()?)
+}
+
 /// Build provider schema
-#[pyfunction]
-pub fn build_schema(schema: &PyDict) -> PyResult<PyDict> {
-    let mut schema_processor = SchemaProcessorV1::new(schema);
-    schema_processor.process();
-    Ok(schema_processor.get_providers().into())
+pub fn build_schema(schema: Py<PyDict>) -> PyResult<Py<PyDict>> {
+    Python::with_gil(|py| -> PyResult<Py<PyDict>> {
+        let mut schema_processor = SchemaProcessorV1::new(py, schema)?;
+        schema_processor.process(py)?;
+        Ok(schema_processor
+            .get_providers(py)?
+            .downcast_bound(py)?
+            .clone()
+            .into())
+    })
 }
