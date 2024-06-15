@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
 use pyo3::{PyTypeCheck, PyTypeInfo};
 use std::collections::HashMap;
+use std::fs;
 
 // use py_async_futures::futures::future::Future;
 // use py_async_futures::futures::FutureExt;
@@ -92,7 +93,7 @@ impl Container {
 }
 
 /// Dynamic inversion of control container
-#[pyclass(extends=Container, module="inj", subclass)]
+#[pyclass(extends=Container, module="inj", subclass, dict)]
 #[derive(Clone)]
 pub struct DynamicContainer {
     #[pyo3(get)]
@@ -104,7 +105,7 @@ pub struct DynamicContainer {
     #[pyo3(get)]
     pub parent: Option<Py<Self>>,
     #[pyo3(get)]
-    pub declarative_parent: Option<Py<PyAny>>,
+    pub declarative_parent: Option<Py<PyType>>,
     #[pyo3(get)]
     pub wiring_config: WiringConfiguration,
     #[pyo3(get)]
@@ -526,11 +527,12 @@ impl DynamicContainer {
     //     self.from_schema(schema)
     // }
     //
-    // fn from_json_schema(&mut self, filepath: &str) -> PyResult<()> {
-    //     let file = py().open(filepath, "r")?;
-    //     let schema = py().import("json")?.call_method1("load", (file,))?;
-    //     self.from_schema(schema)
-    // }
+    fn from_json_schema(&mut self, py: Python, filepath: &str) -> PyResult<()> {
+        let payload = fs::read_to_string(filepath)?;
+        let schema = py.import_bound("json")?.call_method1("loads", (payload,))?;
+        self.from_schema(py, schema.downcast()?.clone().into())?;
+        Ok(())
+    }
 
     /// Try to resolve provider name
     fn resolve_provider_name(&self, provider: Bound<'_, providers::Provider>) -> PyResult<String> {
@@ -539,25 +541,20 @@ impl DynamicContainer {
                 return Ok(provider_name.to_owned());
             }
         }
-        // Err(PyRuntimeError::new_err(format!(
-        //     "Can not resolve name for provider \"{}\"",
-        //     provider
-        // )))
-        Err(PyRuntimeError::new_err("Can not resolve name for provider"))
+        Err(PyRuntimeError::new_err(format!(
+            "Can not resolve name for provider \"{}\"",
+            provider.get_type().name()?
+        )))
     }
 
     /// Return parent name
     #[getter]
     fn parent_name(&self, py: Python) -> PyResult<PyObject> {
-        self.parent
-            .as_ref()
-            .map(|parent| parent.call_method0(py, intern!(py, "parent_name")))
-            .unwrap_or(Ok(py.None().into_py(py)))
-        // .or_else(|| {
-        //     self.declarative_parent
-        //         .as_ref()
-        //         .map(|parent| parent.name().to_owned())
-        // })
+        match (self.parent.as_ref(), self.declarative_parent.as_ref()) {
+            (Some(parent), _) => parent.call_method0(py, "parent_name"),
+            (_, Some(cls)) => Ok(cls.bind(py).name()?.into_py(py)),
+            _ => Ok(py.None()),
+        }
     }
 
     /// Assign parent

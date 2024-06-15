@@ -17,7 +17,7 @@ pub struct SchemaProcessorV1 {
 impl SchemaProcessorV1 {
     fn new(py: Python, schema: Py<PyDict>) -> PyResult<Self> {
         Ok(Self {
-            schema: schema.clone(),
+            schema: schema.clone_ref(py),
             container: py
                 .get_type_bound::<containers::DynamicContainer>()
                 .call0()?
