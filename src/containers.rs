@@ -278,8 +278,14 @@ impl DynamicContainer {
         }
     }
 
-    fn reset_override(&mut self) {
+    fn reset_override(&mut self, py: Python) -> PyResult<()> {
         self.overridden.clear();
+
+        for provider in self.providers.values_mut() {
+            provider.bind(py).call_method0("reset_override")?;
+        }
+
+        Ok(())
     }
 
     //
@@ -334,19 +340,9 @@ impl DynamicContainer {
     //     Ok(())
     // }
     //
-    // fn reset_override(&mut self) -> PyResult<()> {
-    //     self.overridden.clear();
-    //
-    //     for provider in self.providers.values() {
-    //         provider.reset_override()?;
-    //     }
-    //
-    //     Ok(())
-    // }
-    //
-    // fn is_auto_wiring_enabled(&self) -> bool {
-    //     self.wiring_config.auto_wire
-    // }
+    fn is_auto_wiring_enabled(&self) -> bool {
+        self.wiring_config.auto_wire
+    }
     //
     // fn wire(
     //     &mut self,
