@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 
 #[pyclass(module = "inj", subclass)]
 #[derive(Clone)]
@@ -158,5 +159,89 @@ impl Container {
         };
         let base = Provider::new();
         (this, base)
+    }
+}
+
+#[pyfunction]
+pub fn traverse(
+    py: Python,
+    providers: Vec<Py<Provider>>,
+    types: Option<Vec<Py<PyType>>>,
+) -> PyResult<Bound<'_, PyIterator>> {
+    let traverse = Traverse::new(py, providers, types);
+    PyIterator::from_bound_object(traverse.into_py(py).bind(py))
+}
+
+// #[pyclass]
+// struct TraversePyIter {
+//     inner: IntoIterator<Item = Py<Provider>>,
+// }
+//
+// #[pymethods]
+// impl TraversePyIter {
+//     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+//         slf
+//     }
+//
+//     fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<Py<Provider>> {
+//         slf.inner.next()
+//     }
+// }
+//
+
+#[pyclass]
+pub struct Traverse {
+    providers: Vec<Py<Provider>>,
+    visited: HashSet<usize>,
+    to_visit: VecDeque<Py<Provider>>,
+    types: Option<Py<PyTuple>>,
+}
+
+impl Traverse {
+    pub fn new(py: Python, providers: Vec<Py<Provider>>, types: Option<Vec<Py<PyType>>>) -> Self {
+        Self {
+            providers: providers.clone(),
+            visited: HashSet::new(),
+            to_visit: providers.clone().into(),
+            types: types.map(|ty| PyTuple::new_bound(py, ty).unbind()),
+        }
+    }
+    fn visit(&mut self, py: Python, visiting: Py<Provider>) -> PyResult<Py<Provider>> {
+        self.visited.insert(visiting.as_ptr() as usize);
+        visiting
+            .bind(py)
+            .getattr("related")?
+            .extract::<Vec<Bound<'_, Provider>>>()?
+            .iter()
+            .filter(|x| self.visited.contains(&(x.as_ptr() as usize)))
+            .for_each(|x| self.to_visit.push_back(x.clone().unbind()));
+        return Ok(visiting);
+    }
+}
+
+#[pymethods]
+impl Traverse {
+    fn __iter__(_self: PyRef<Self>) -> PyRef<Self> {
+        _self
+    }
+
+    fn __next__(mut _self: PyRefMut<Self>, py: Python) -> Option<PyResult<Py<Provider>>> {
+        while let Some(visiting) = _self.to_visit.pop_front() {
+            match _self.visit(py, visiting) {
+                Ok(provider) => {
+                    if let Some(types) = &_self.types {
+                        match provider.bind(py).is_instance(types.bind(py)) {
+                            Ok(false) => continue,
+                            Ok(true) => return Some(Ok(provider.clone())),
+                            Err(err) => return Some(Err(err)),
+                        }
+                    } else {
+                        return Some(Ok(provider.clone()));
+                    }
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+        None
     }
 }

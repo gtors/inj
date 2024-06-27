@@ -2,7 +2,7 @@ use crate::{providers, schema};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 use pyo3::{PyTypeCheck, PyTypeInfo};
 use std::collections::HashMap;
 use std::fs;
@@ -223,13 +223,14 @@ impl DynamicContainer {
         Ok(deps)
     }
 
-    // fn traverse(&self, types: Option<&PyTuple>) -> PyResult<PyObject> {
-    //     let providers_list: Vec<PyObject> = self.providers.values().cloned().collect();
-    //     let providers_tuple = PyTuple::new(py, providers_list);
-    //     let providers_module = py.import("dependency_injector.providers")?;
-    //     providers_module.call_method1("traverse", (providers_tuple, types))
-    // }
-    //
+    fn traverse<'py>(
+        &self,
+        py: Python<'py>,
+        types: Option<Vec<Py<PyType>>>,
+    ) -> PyResult<Bound<'py, PyIterator>> {
+        let providers: Vec<_> = self.providers.values().map(|p| p.clone()).collect();
+        providers::traverse(py, providers, types)
+    }
 
     /// Set container providers
     #[pyo3(signature = (**providers))]
